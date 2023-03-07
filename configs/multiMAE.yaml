@@ -1,0 +1,141 @@
+data_name: "habitat"
+data:
+  dataset_config:
+    container_dir: /datadrive/azure_storage/pactdata/habitat-data  # will be /mnt/data in aml experiments
+    train_recorddir: ${data.dataset_config.container_dir}/collected-data/hm3d/train/seqrecord 
+    val_recorddir: ${data.dataset_config.container_dir}/collected-data/hm3d/val/seqrecord  
+    features_rename: # mapping feature stored in seqrecord to feature to be used in training
+      "observations->rgb": "rgb"
+      "observations->depth" : "depth"  
+    transform_config: 
+      name: "transform_habitat"
+      kwargs:
+        input_size: ${model.model_config.input_size}
+        hflip: 0.5
+    inputs: ["rgb", "depth"]
+  dataloader_config:
+    batch_size: 128 # on 32G gpu v100, 128 for fl16, 64 for fl32
+    num_workers: 6
+    val_num_workers: 6
+    shuffle_buffer_size: 1000
+    prefetch_factor: 2
+    pin_memory: false
+
+model_name: "MultiMAE"
+model:
+
+  model_config:
+    in_domains: ${data.dataset_config.inputs}
+    out_domains: ${data.dataset_config.inputs}
+ 
+    standardize_depth: True 
+    extra_norm_pix_loss: False 
+    model_type: "pretrain_multimae_base"
+    num_encoded_tokens: 98
+    num_global_tokens: 1
+    patch_size: 16
+    input_size: 224
+    alphas: 1.0 # dirichlet alphas concentration parameters
+    sample_tasks_uniformly: false
+    decoder_use_task_queries: true 
+    decoder_use_xattn: true 
+    decoder_dim: 256
+    decoder_depth: 2
+    decoder_num_heads: 8
+    drop_path: 0.0 # ! drop path rate, what is this?
+    fp32_output_adapters: "" # tasks output adapters to compute in fp32 mode, separated by hyphen
+    loss_on_unmasked: False
+ 
+  optimizer_config:
+    eps: 1e-8  # optimizer epsilon
+    # clip_grad_norm: None in trainer section
+    betas: [0.9, 0.95]
+    weight_decay: 0.05
+    lr: 1e-4  # base learning rate lr = base_lr [1e-4] * batch_size / 256
+    
+  scheduler_config:
+    warmup_epochs: 4 # math expression here?
+    max_epochs: ${trainer.max_epochs}
+    start_lr: 1e-6
+    min_lr: 1e-6 
+
+
+seed_everything: 42
+# trainer config
+trainer:
+  default_root_dir: ${oc.env:AMLT_OUTPUT_DIR,outputs}
+  
+  # training setup
+  num_nodes: 1
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_false
+
+  num_sanity_val_steps: 0
+  min_epochs: 1
+  max_epochs: 2
+  enable_progress_bar: true
+  
+  # trainning config
+  precision: 16
+  gradient_clip_val: 1.0
+  sync_batchnorm: False
+  
+  # check point
+  enable_checkpointing: True
+  resume_from_checkpoint: null
+  
+  ## debugging
+  fast_dev_run: false
+
+
+logger:
+  tensorboard:
+    _target_: pytorch_lightning.loggers.tensorboard.TensorBoardLogger
+    save_dir: "${trainer.default_root_dir}/logs"
+    name: null
+    version: null
+    log_graph: False
+    default_hp_metric: True
+    prefix: ""
+
+
+callbacks:
+  checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "${trainer.default_root_dir}/checkpoints/"
+    monitor: "val/loss_total" # name of the logged metric which determines when model is improving
+    mode: "min" # "max" means higher metric value is better, can be also "min"
+    save_top_k: 1 # save k best models (determined by above metric)
+    save_last: True # additionaly always save model from last epoch
+    verbose: False
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: False
+    save_on_train_epoch_end: False
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "val/loss_total" # name of the logged metric which determines when model is improving
+    mode: "min" # "max" means higher metric value is better, can be also "min"
+    patience: 10 # how many validation epochs of not improving until training stops
+    min_delta: 0 # minimum change in the monitored metric needed to qualify as an improvement
+    check_on_train_epoch_end: false
+
+  model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: -1
+
+  progress:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+
+  lr_monitor:
+    _target_: pytorch_lightning.callbacks.Timer
+    interval: "epoch"
+
+  timer:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: "step"
+
+  plot_inference:
+    _target_: models.MultiMAE.callbacks.PlotMultiMAEInference
+    inputs: [["rgb"], ["depth"]]
+    mask_on_inputs_during_inference: False # if put mask on inputs for inputs2inputs prediction during validation
